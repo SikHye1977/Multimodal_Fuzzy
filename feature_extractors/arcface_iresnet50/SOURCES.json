@@ -1,0 +1,28 @@
+{
+  "repository": "https://github.com/deepinsight/insightface",
+  "revision": "3e6486942a1be2da0e5b475fac375ea73264bd21",
+  "weights_url": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+  "variant": "w600k_r50 + det_10g",
+  "files": {
+    "weights/det_10g.onnx": {
+      "bytes": 16923827,
+      "sha256": "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91"
+    },
+    "weights/w600k_r50.onnx": {
+      "bytes": 174383860,
+      "sha256": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43"
+    }
+  },
+  "source_files": {
+    "vendor/LICENSE": "8be185bb59633fb66c5ee6ee3fdcbf0894eba65cce88bb442ec9c2f397a9dec0",
+    "vendor/REVISION": "ff85261012d79d0d86b65814619be06fa2a5c5e8d7e20530e1132340db37e02d",
+    "vendor/SCRFD_LICENSE": "02c5c55e19772184872c6c455553b15e4acac4b3a757550e7374f47723868ce1",
+    "vendor/__init__.py": "533ef06e156b17f37879cbc8b35fb6a8aa71c54b90c68528efea46620274dfb2",
+    "vendor/arcface_onnx.py": "89041694a9c2ec9f84c506797a810b5dc95ab57f89407de541de62a6fea981a9",
+    "vendor/face_align.py": "a8b34ddd06716f5ca7e7501415cbd3789ccbce18db9e557b35e537695290d922",
+    "vendor/iresnet.py": "fb57d145c4c26d8e55680c24fa164541a7222ccdefa3a1716c054ff4c5859753",
+    "vendor/python-package_README.md": "b1053fb8c67c8e0d5691151fe2793d9dcba1527fc1d089feb64665e307796f86",
+    "vendor/scrfd.py": "64b0b787e4c235ff80c1141614a77f2b2c24c90ba5b920f1bc91fde80cbef9f9"
+  },
+  "local_source_changes": []
+}
