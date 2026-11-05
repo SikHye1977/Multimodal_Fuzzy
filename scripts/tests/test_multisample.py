@@ -12,34 +12,10 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from scripts import train_thresholding_multisample_abc as ex
+from scripts.s09_multisample import train as ex
 
 
-def synthetic_data():
-    rng = np.random.default_rng(104)
-    users, arrays, files, groups = [], {}, {}, {}
-    for s, split in enumerate(ex.common.SPLITS):
-        for i in range(4):
-            users.append(ex.common.VirtualUser(split, f"f{s}-{i}", f"p{s}-{i//2}", str(i % 2)))
-    for m in ex.MODALITIES:
-        arrays[m], files[m], groups[m] = [], [], {}
-        for u in users:
-            identity = u.face_person if m == "face" else u.finger
-            center = rng.normal(size=512)
-            ids = []
-            for k in range(10 if m == "face" else 8):
-                ids.append(len(arrays[m]))
-                x = center+rng.normal(scale=.6, size=512)
-                arrays[m].append((x/np.linalg.norm(x)).astype(np.float32))
-                files[m].append(f"synthetic-{m}-{identity}-{k}")
-            groups[m][identity] = ids
-        arrays[m] = np.stack(arrays[m])
-    original = deepcopy(arrays)
-    def assert_unchanged():
-        for m in ex.MODALITIES:
-            np.testing.assert_array_equal(original[m], arrays[m])
-    return SimpleNamespace(arrays=arrays, files=files, groups=groups, hashes={},
-                           assert_unchanged=assert_unchanged), users
+from scripts.tests.helpers import multisample_data as synthetic_data
 
 
 class MultiSampleTests(unittest.TestCase):
@@ -65,7 +41,7 @@ class MultiSampleTests(unittest.TestCase):
         for _ in range(steps):
             optimizer.zero_grad(set_to_none=True)
             e, q = ex.forward_pair(model, "C", self.bank, rows)
-            losses = ex.v3.loss_function(model, e, q, rows, self.users, self.args)
+            losses = ex.loss_ops.joint_threshold_loss(model, e, q, rows, self.users, self.args)
             losses["total"].backward()
             optimizer.step()
         return losses
@@ -186,7 +162,7 @@ class MultiSampleTests(unittest.TestCase):
 
     def test_check_only_and_invalid_protocols(self):
         self.data.directory = Path(self.tmp.name)/"input"
-        with patch.object(ex.previous, "prepare_source", return_value=(self.data, self.users, {}, {"seed": 17}, {})), \
+        with patch.object(ex.provenance, "prepare_source", return_value=(self.data, self.users, {}, {"seed": 17}, {})), \
              patch.object(ex, "run", side_effect=AssertionError("must not run")), \
              patch.object(torch.optim, "Adam", side_effect=AssertionError("must not optimize")), redirect_stdout(io.StringIO()):
             ex.main(["--check-only", "--output-dir", str(self.args.output_dir)])

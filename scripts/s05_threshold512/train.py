@@ -21,67 +21,25 @@ import traceback
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from Thresholding_Model_512 import Thresholding512Config, ThresholdingModel512, MODES, MODALITIES
-from thresholding.variability_model import ModelConfig, ReliabilityHead
-from scripts import train_thresholding_reliability_abc as previous
+from scripts import common
+from scripts.common import (data as protocol, losses as loss_ops, metrics as metric_ops,
+                            training as train_ops, reporting, provenance)
+from scripts.common.bch_evaluator import BCHEvaluator
+from Thresholding_Model_512 import ThresholdingModel512
+MODALITIES = common.MODALITIES
+make_model = train_ops.make_coordinate_model
+threshold_loss = loss_ops.coordinate_threshold_loss
+bit_metrics = metric_ops.coordinate_bit_metrics
+selection_guard = metric_ops.coordinate_selection_guard
 
-common, contrastive, architectures = previous.common, previous.contrastive, previous.architectures
+from Thresholding_Model_512 import ThresholdingModel512, MODES, MODALITIES
+
 DESCRIPTIONS = {"zero": "tau=0; same reliability head as learned modes",
                 "fixed": "512 globally learned coordinate thresholds per modality; shared by all users",
                 "dynamic": "512 global base thresholds + input-dependent 512-D residual per modality"}
-
-
-def make_model(args, mode, seed):
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        model = ThresholdingModel512(Thresholding512Config(
-            mode, args.temperature, args.tau_base_bound, args.tau_delta_bound, args.hidden_dim))
-        # Reliability initialization must not depend on threshold parameter count.
-        torch.manual_seed((seed + 100003) % 2**32)
-        for m in MODALITIES:
-            model.reliability[m].load_state_dict(ReliabilityHead(ModelConfig(arm="B")).state_dict())
-    return model.to(args.device).set_stage("inference")
-
-
-def threshold_loss(model, e, q, rows, users, args):
-    labels = contrastive.identity_codes(rows, users, args.device)
-    loss = architectures.compute_losses(e, q, labels, contrastive.loss_settings(args))
-    stability = torch.stack([((e[f"{m}_tau"] - q[f"{m}_tau"]) / model.config.tau_bound).square().mean()
-                             for m in MODALITIES]).mean()
-    residual = torch.stack([(out[f"{m}_delta_tau"] / model.config.tau_delta_bound).square().mean()
-                            for m in MODALITIES for out in (e, q)]).mean()
-    return {"total": loss["total"] + args.tau_stability_weight*stability + args.tau_residual_weight*residual,
-            **{key: value for key, value in loss.items() if key != "total"},
-            "tau_stability": stability, "tau_residual": residual}
-
-
-def bit_metrics(e, q, plan, args):
-    metrics = previous.bit_metrics(e, q, plan, args)
-    for m in MODALITIES:
-        for role, out in (("enrollment", e), ("query", q)):
-            tau = out[f"{m}_tau"]
-            if tau.shape != out[f"{m}_bits"].shape or tau.shape[1] != 512:
-                raise RuntimeError("Expected genuine 512-D thresholds, not scalar broadcasting")
-            metrics["tau"][m][role].update({
-                "mean_absolute": float(tau.abs().mean()), "min": float(tau.min()), "max": float(tau.max()),
-                "within_vector_std_mean": float(tau.std(dim=1, unbiased=False).mean()),
-                "across_observations_std_mean": float(tau.std(dim=0, unbiased=False).mean()),
-                "bound_saturation_fraction": float((tau.abs() >= .98*(args.tau_base_bound+args.tau_delta_bound)).float().mean())})
-    return metrics
-
-
-def selection_guard(metrics, baseline, args):
-    eligible, reasons = contrastive.selection_guard(metrics, baseline, args)
-    # Row balance alone permits an identical balanced code for all people.
-    for m in MODALITIES:
-        for key, allowance in (("constant_coordinate_fraction", args.max_constant_increase),
-                               ("coordinate_balance_error", args.max_coordinate_balance_increase)):
-            if metrics["bits"][m][key] > baseline["bits"][m][key] + allowance + 1e-12:
-                reasons.append(f"{m}.{key} increased by more than {allowance}")
-    return eligible and not reasons, reasons
 
 
 def train_stage(model, stage, data, users, cache, validation, plan, baseline, args, seed,
@@ -93,8 +51,8 @@ def train_stage(model, stage, data, users, cache, validation, plan, baseline, ar
     optimizer = torch.optim.Adam(params, lr=args.threshold_lr if is_tau else args.reliability_lr,
                                  weight_decay=0 if is_tau else args.reliability_weight_decay)
     epochs = args.threshold_epochs if is_tau else args.reliability_epochs
-    e, q = previous.collect(model, cache, validation, args.batch_size, reliability=not is_tau)
-    best = bit_metrics(e, q, plan, args) if is_tau else previous.evaluate_reliability(model, e, q, detailed=False)
+    e, q = train_ops.collect(model, cache, validation, args.batch_size, reliability=not is_tau)
+    best = bit_metrics(e, q, plan, args) if is_tau else metric_ops.evaluate_reliability(model, e, q, detailed=False)
     initial, best_epoch, stale = best, 0, 0
     best_path = directory / ("best_threshold.pt" if is_tau else "best_model.pt")
     meta = {"mode": model.config.mode, "seed": seed, "stage": stage, "epoch": 0,
@@ -104,13 +62,13 @@ def train_stage(model, stage, data, users, cache, validation, plan, baseline, ar
     progress = common.Progress(f"{model.config.mode} seed={seed} {stage}", epochs, future, args.log_interval)
     for epoch in range(1, epochs + 1):
         model.train()
-        batches, padding = previous.make_schedule(data, users, args, seed, epoch, stage, schedules)
+        batches, padding = train_ops.make_schedule(data, users, args, seed, epoch, stage, schedules)
         steps, sums, count = len(batches)+math.ceil(len(validation)/args.batch_size), defaultdict(float), 0
         for step, (batch, _) in enumerate(batches, 1):
             optimizer.zero_grad(set_to_none=True)
             e, q = common.forward_pair(model, cache, batch)
             losses = (threshold_loss(model, e, q, batch, users, args) if is_tau
-                      else {"total": previous.reliability_loss(e, q)})
+                      else {"total": loss_ops.reliability_loss(e, q)})
             if not bool(torch.isfinite(losses["total"])):
                 raise RuntimeError(f"Nonfinite {stage} loss")
             losses["total"].backward()
@@ -122,12 +80,12 @@ def train_stage(model, stage, data, users, cache, validation, plan, baseline, ar
             count += len(batch)
             progress.update(epoch, step, steps, "train", sums["total"]/count)
         if frozen is not None:
-            previous.assert_fixed(model, frozen)
-        e, q = previous.collect(model, cache, validation, args.batch_size, reliability=not is_tau,
+            train_ops.assert_fixed(model, frozen)
+        e, q = train_ops.collect(model, cache, validation, args.batch_size, reliability=not is_tau,
                                 on_batch=lambda k: progress.update(epoch, len(batches)+k, steps, "validation", sums["total"]/count))
-        metrics = bit_metrics(e, q, plan, args) if is_tau else previous.evaluate_reliability(model, e, q, detailed=False)
+        metrics = bit_metrics(e, q, plan, args) if is_tau else metric_ops.evaluate_reliability(model, e, q, detailed=False)
         eligible, reasons = selection_guard(metrics, baseline, args) if is_tau else (True, [])
-        improved = eligible and (previous.threshold_better(metrics, best, args) if is_tau else
+        improved = eligible and (metric_ops.threshold_better(metrics, best, args) if is_tau else
                                 metrics["selection_bce"] < best["selection_bce"] - args.min_delta)
         if improved:
             best, best_epoch, stale = metrics, epoch, 0
@@ -147,7 +105,7 @@ def train_stage(model, stage, data, users, cache, validation, plan, baseline, ar
             break
     selected, chosen_meta = ThresholdingModel512.load_checkpoint(best_path, args.device)
     if frozen is not None:
-        previous.assert_fixed(selected, frozen)
+        train_ops.assert_fixed(selected, frozen)
         selected.reliability_fitted.fill_(best_epoch > 0)
         selected.save_checkpoint(best_path, {**chosen_meta, "reliability_fitted": best_epoch > 0})
     return selected, {"best_epoch": best_epoch, "epochs_run": epoch, "origin": chosen_meta["origin"],
@@ -155,21 +113,21 @@ def train_stage(model, stage, data, users, cache, validation, plan, baseline, ar
 
 
 def evaluate_trial(model, cache, rows, plan, args, directory, split, data):
-    e, q = previous.collect(model, cache, rows, args.batch_size, reliability=True)
-    result = {"bits": bit_metrics(e, q, plan, args), "reliability": previous.evaluate_reliability(model, e, q),
+    e, q = train_ops.collect(model, cache, rows, args.batch_size, reliability=True)
+    result = {"bits": bit_metrics(e, q, plan, args), "reliability": metric_ops.evaluate_reliability(model, e, q),
               "reliability_fitted": bool(model.reliability_fitted), "unique_pair_diagnostics": {}}
     for m, columns in (("face", [common.EF, common.QF]), ("fingerprint", [common.EP, common.QP])):
         _, unique = np.unique(rows[:, columns], axis=0, return_index=True)
         y = (e[f"{m}_bits"][unique] == q[f"{m}_bits"][unique]).numpy()
         logits = q[f"{m}_reliability_logits"][unique].numpy()
-        aucs = [previous.roc_auc(a, b) for a, b in zip(y, logits)]
+        aucs = [metric_ops.roc_auc(a, b) for a, b in zip(y, logits)]
         aucs = [v for v in aucs if v is not None]
         result["unique_pair_diagnostics"][m] = {
             "pair_count": len(unique), "genuine_hamming_bits": float((~y).sum(1).mean()),
             "query_within_pair_auroc_mean": float(np.mean(aucs)) if aucs else None,
             "query_within_pair_auroc_defined_pairs": len(aucs),
             "query_lowest10_error_precision_mean": float(np.mean([
-                previous.low_confidence_precision(~a, b, .1) for a, b in zip(y, logits)]))}
+                metric_ops.low_confidence_precision(~a, b, .1) for a, b in zip(y, logits)]))}
     records = []
     for i, row in enumerate(rows):
         item = {"pair_index": i, "virtual_user_index": int(row[common.USER])}
@@ -201,12 +159,9 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
     try:
         common.write_json(args.output_dir/"status.json", {"state": "running", "synthetic_test_only": synthetic})
         if not synthetic:
-            for name in previous.MANIFESTS:
+            for name in protocol.MANIFESTS:
                 shutil.copy2(args.source_run/name, args.output_dir/name)
-        paths = [Path(__file__), ROOT/"Thresholding_Model_512.py", ROOT/"thresholding/variability_model.py",
-                 Path(previous.__file__), Path(common.__file__), Path(contrastive.__file__), Path(architectures.__file__),
-                 ROOT/"scripts/train_reliability_distance.py", ROOT/"scripts/train_thresholding_ablation.py", ROOT/"Thresholding Model.py"]
-        code_hashes = {str(path): common.sha256(path) for path in paths}
+        code_hashes = provenance.code_hashes(__file__)
         common.write_json(args.output_dir/"config.json", {
             **{k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
             "started_at_utc": datetime.now(timezone.utc).isoformat(), "python": platform.python_version(),
@@ -217,9 +172,9 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
             "selection": "guarded hard validation radius rates then mean Hamming; reliability: pooled genuine BCE",
             "loss": "preceding D loss + normalized pair tau consistency + dynamic residual penalty"})
         cache = {m: torch.tensor(v, device=args.device) for m,v in data.arrays.items()}
-        plans = {s: contrastive.evaluation_plan(pairs[s], users, "cpu") for s in ("validation", "test")}
+        plans = {s: metric_ops.evaluation_plan(pairs[s], users, "cpu") for s in ("validation", "test")}
         zero = make_model(args, "zero", args.seeds[0])
-        e, q = previous.collect(zero, cache, pairs["validation"], args.batch_size)
+        e, q = train_ops.collect(zero, cache, pairs["validation"], args.batch_size)
         baseline = bit_metrics(e, q, plans["validation"], args)
         common.write_json(args.output_dir/"zero_validation.json", baseline)
         jobs = [(seed, mode) for seed in args.seeds for mode in args.modes]
@@ -239,7 +194,7 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
                 model, threshold = train_stage(model, "threshold", data, users, cache, pairs["validation"],
                                                plans["validation"], baseline, args, seed, directory, trial_log,
                                                schedules, future+args.reliability_epochs)
-            stats = previous.fit_statistics(model, cache, data, users, pairs["train"], args)
+            stats = train_ops.fit_statistics(model, cache, data, users, pairs["train"], args)
             for m in MODALITIES:
                 model.reliability[m].set_statistics(stats[m])
             common.write_json(directory/"train_statistics.json", stats)
@@ -266,7 +221,7 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
             common.write_json(directory/"report.json", trial)
             common.write_json(directory/"status.json", {"state": "completed"})
             log.message(f"시험 완료: {trial['arm']} seed={trial['seed']}")
-        rows, aggregate, _ = previous.tables(trials)
+        rows, aggregate, _ = reporting.reliability_tables(trials)
         for name, values in (("comparison.csv",rows), ("aggregate.csv",aggregate)):
             common.write_csv(args.output_dir/name, list(values[0]), values)
         deltas = []
@@ -330,7 +285,7 @@ def parse_args(argv=None):
                         'max_row_outside_increase':.01, 'max_constant_increase':.02,
                         'max_coordinate_balance_increase':.005}.items():
         p.add_argument('--'+name.replace('_','-'), type=float, default=value)
-    for name, value in asdict(contrastive.LossSettings()).items():
+    for name, value in asdict(loss_ops.LossSettings()).items():
         p.add_argument('--'+name.replace('_','-'), type=type(value), default=value)
     p.add_argument('--check-only', action='store_true')
     args = p.parse_args(argv)
@@ -348,7 +303,7 @@ def parse_args(argv=None):
     if args.variance_shrinkage > 1:
         p.error('variance-shrinkage must be <= 1')
     try:
-        contrastive.loss_settings(args)
+        loss_ops.loss_settings(args)
     except ValueError as error:
         p.error(str(error))
     args.source_run = args.source_run.expanduser().resolve()
@@ -375,7 +330,7 @@ def main(argv=None):
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     print('기존 임베딩·사람 단위 분할·등록/질의 쌍을 검증합니다.', flush=True)
-    data, users, pairs, source, hashes = previous.prepare_source(args)
+    data, users, pairs, source, hashes = provenance.prepare_source(args)
     if args.output_dir.is_relative_to(data.directory.resolve()):
         raise ValueError('Output cannot be inside input embeddings')
     if args.check_only:

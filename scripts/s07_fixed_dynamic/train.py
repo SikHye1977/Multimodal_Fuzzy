@@ -22,13 +22,16 @@ import traceback
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts import train_thresholding_bch_abc as abc
+from scripts import common
+from scripts.common import data as protocol, losses as loss_ops, metrics as metric_ops, training as train_ops, provenance
+from scripts.common.bch_evaluator import BCHEvaluator
+from Thresholding_Model_512 import ThresholdingModel512
+MODALITIES = common.MODALITIES
 
-common, previous, base = abc.common, abc.previous, abc.base
-MODALITIES = abc.MODALITIES
+
 MODES = ("fixed", "dynamic")
 PRIMARY = "mean_unique_within_radius_fraction"
 DESCRIPTIONS = {
@@ -40,7 +43,7 @@ DESCRIPTIONS = {
 @torch.no_grad()
 def initial_output_digest(model, cache, rows):
     """Different architectures must start with identical zero tau and hard bits."""
-    outputs = abc.quantize_pair(model, cache, rows)
+    outputs = train_ops.quantize_pair(model, cache, rows)
     inputs = common.model_inputs(cache, rows)
     digest = hashlib.sha256()
     for out, pair in zip(outputs, ((inputs[0], inputs[1]), (inputs[2], inputs[3]))):
@@ -55,16 +58,16 @@ def initial_output_digest(model, cache, rows):
 
 @torch.no_grad()
 def evaluate(model, cache, rows, users, plan, args, on_batch=None):
-    e, q = previous.collect(model, cache, rows, args.batch_size, on_batch=on_batch)
-    result = base.bit_metrics(e, q, plan, args)
+    e, q = train_ops.collect(model, cache, rows, args.batch_size, on_batch=on_batch)
+    result = metric_ops.coordinate_bit_metrics(e, q, plan, args)
     result["unique_pairs"] = {}
     for m, cols in (("face", [common.EF, common.QF]), ("fingerprint", [common.EP, common.QP])):
-        idx = abc.unique_indices(rows[:, cols])
+        idx = metric_ops.unique_indices(rows[:, cols])
         d = (e[f"{m}_bits"][idx] != q[f"{m}_bits"][idx]).sum(1).numpy()
         et, qt = e[f"{m}_tau"][idx], q[f"{m}_tau"][idx]
         # Tau variability uses each observed image once, avoiding repeated pairs.
         sample_ids = np.r_[rows[:, cols[0]], rows[:, cols[1]]]
-        observations = abc.unique_indices(sample_ids)
+        observations = metric_ops.unique_indices(sample_ids)
         all_tau = torch.cat((e[f"{m}_tau"], q[f"{m}_tau"]))[observations]
         result["unique_pairs"][m] = {
             "genuine_pair_count": len(idx), "genuine_hamming_bits": float(d.mean()),
@@ -78,7 +81,7 @@ def evaluate(model, cache, rows, users, plan, args, on_batch=None):
             "tau_across_unique_images_std_mean": float(all_tau.std(dim=0, unbiased=False).mean()),
             "tau_genuine_mean_absolute_difference": float((et - qt).abs().mean()),
             "tau_bound_saturation_fraction": float((all_tau.abs() >= .98*model.config.tau_bound).float().mean()),
-            "negative_scopes": abc.negative_diagnostics(e, q, rows, users, m, args.bch_t)}
+            "negative_scopes": metric_ops.negative_diagnostics(e, q, rows, users, m, args.bch_t)}
     for key in ("within_radius_fraction", "genuine_hamming_bits"):
         result["mean_unique_" + key] = sum(result["unique_pairs"][m][key] for m in MODALITIES) / 2
     return result, e, q
@@ -105,13 +108,13 @@ def train_trial(model, seed, data, users, cache, rows, plan, baseline, args, dir
     progress = common.Progress(f"C/{model.config.mode} seed={seed}", args.epochs, future, args.log_interval)
     for epoch in range(1, args.epochs + 1):
         model.train()
-        batches, padding = previous.make_schedule(data, users, args, seed, epoch, "threshold", schedules)
+        batches, padding = train_ops.make_schedule(data, users, args, seed, epoch, "threshold", schedules)
         steps = len(batches) + math.ceil(len(rows) / args.batch_size)
         sums, count = defaultdict(float), 0
         for step, (batch, _) in enumerate(batches, 1):
             optimizer.zero_grad(set_to_none=True)
-            e, q = abc.quantize_pair(model, cache, batch)
-            losses = abc.threshold_loss(model, e, q, batch, users, args, "C")
+            e, q = train_ops.quantize_pair(model, cache, batch)
+            losses = loss_ops.bch_threshold_loss(model, e, q, batch, users, args, "C")
             if not bool(torch.isfinite(losses["total"])):
                 raise RuntimeError("Nonfinite C loss")
             losses["total"].backward()
@@ -124,7 +127,7 @@ def train_trial(model, seed, data, users, cache, rows, plan, baseline, args, dir
             progress.update(epoch, step, steps, "train", sums["total"] / count)
         metrics, _, _ = evaluate(model, cache, rows, users, plan, args,
             on_batch=lambda k: progress.update(epoch, len(batches)+k, steps, "validation", sums["total"]/count))
-        eligible, reasons = abc.selection_guard(metrics, baseline, args)
+        eligible, reasons = metric_ops.bch_selection_guard(metrics, baseline, args)
         improved = eligible and better(metrics, best, args)
         if improved:
             best, best_epoch, stale = metrics, epoch, 0
@@ -154,7 +157,7 @@ def export_details(directory, split, rows, data, e, q, args):
         distances = (e[f"{m}_bits"] != q[f"{m}_bits"]).sum(1).numpy()
         arrays[f"{m}_hamming_bits"] = distances
         arrays[f"{m}_within_radius"] = distances <= args.bch_t
-        for i in abc.unique_indices(rows[:, cols]):
+        for i in metric_ops.unique_indices(rows[:, cols]):
             records.append({"modality": m, "enrollment": data.files[m][int(rows[i, cols[0]])],
                 "query": data.files[m][int(rows[i, cols[1]])], "hamming_bits": int(distances[i]),
                 "within_radius": int(distances[i] <= args.bch_t),
@@ -219,13 +222,9 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
     try:
         common.write_json(args.output_dir / "status.json", {"state": "running", "synthetic_test_only": synthetic})
         if not synthetic:
-            for name in previous.MANIFESTS:
+            for name in protocol.MANIFESTS:
                 shutil.copy2(args.source_run / name, args.output_dir / name)
-        paths = [Path(__file__), Path(abc.__file__), Path(base.__file__), Path(previous.__file__), Path(common.__file__),
-            Path(abc.contrastive.__file__), Path(base.architectures.__file__), ROOT/"Thresholding_Model_512.py",
-            ROOT/"thresholding/variability_model.py", ROOT/"Thresholding Model.py",
-            ROOT/"scripts/train_reliability_distance.py", ROOT/"scripts/train_thresholding_ablation.py"]
-        code_hashes = {str(path): common.sha256(path) for path in paths}
+        code_hashes = provenance.code_hashes(__file__)
         config = {**{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "loss_arm": "C", "modes": list(MODES), "mode_descriptions": DESCRIPTIONS,
             "started_at_utc": datetime.now(timezone.utc).isoformat(), "python": platform.python_version(), "torch": str(torch.__version__),
@@ -235,14 +234,14 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
             "test_used_for_selection": False, "BCH_decoding": False, "FE_key_evaluation": False, "reliability_trained": False,
             "requires_new_enrollment": True, "checkpoint_resuming_supported": False,
             "initialization": "Both modes start at tau=0. Architecture weights differ; initial outputs and batch schedules are matched.",
-            "C_loss": "Unmodified train_thresholding_bch_abc.threshold_loss(..., arm='C'), including all regularizers"}
+            "C_loss": "Unmodified train_thresholding_bch_losses.bch_threshold_loss(..., arm='C'), including all regularizers"}
         common.write_json(args.output_dir / "config.json", config)
         log.message(f"결과: {args.output_dir}\nC 손실 고정 | fixed / dynamic | 성공 기준: {args.bch_t}비트 이내 | C 목표: {args.bch_t-args.safety_margin}비트")
         log.message("두 구조 모두 tau=0에서 시작합니다. 같은 시드는 같은 학습 쌍과 배치 순서를 사용합니다.")
         log.message("ETA는 남은 최대 epoch와 관측 속도를 사용합니다. 조기 종료와 최종 평가에 따라 달라집니다.")
         cache = {m: torch.tensor(x, device=args.device) for m, x in data.arrays.items()}
-        plans = {s: abc.contrastive.evaluation_plan(pairs[s], users, "cpu") for s in ("validation", "test")}
-        zero = base.make_model(args, "zero", args.seeds[0])
+        plans = {s: metric_ops.evaluation_plan(pairs[s], users, "cpu") for s in ("validation", "test")}
+        zero = train_ops.make_coordinate_model(args, "zero", args.seeds[0])
         baseline, _, _ = evaluate(zero, cache, pairs["validation"], users, plans["validation"], args)
         baselines = {"validation": baseline}
         common.write_json(args.output_dir / "zero_validation.json", baseline)
@@ -252,7 +251,7 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
             current = args.output_dir / f"{mode}_seed{seed}"
             current.mkdir()
             common.write_json(current / "status.json", {"state": "training"})
-            model = base.make_model(args, mode, seed)
+            model = train_ops.make_coordinate_model(args, mode, seed)
             digest = initial_output_digest(model, cache, pairs["train"][:args.batch_size])
             if str(seed) in initial_hashes and initial_hashes[str(seed)] != digest:
                 raise RuntimeError("Initial fixed/dynamic outputs differ")
@@ -274,7 +273,7 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
         export_details(args.output_dir, "zero_test", pairs["test"], data, e, q, args)
         for j, trial in enumerate(trials):
             current = Path(trial["checkpoint"]).parent
-            model, _ = abc.ThresholdingModel512.load_checkpoint(trial["checkpoint"], args.device)
+            model, _ = ThresholdingModel512.load_checkpoint(trial["checkpoint"], args.device)
             progress = common.Progress(f"최종평가 {trial['mode']} seed={trial['seed']}", 2, 2*(len(trials)-j-1), args.log_interval)
             for epoch, split in enumerate(("validation", "test"), 1):
                 steps = math.ceil(len(pairs[split])/args.batch_size)
@@ -331,7 +330,7 @@ def parse_args(argv=None):
             "max_genuine_increase_bits": .5, "max_genuine_p95_increase_bits": 5., "max_row_outside_increase": .01,
             "max_constant_increase": .02, "max_coordinate_balance_increase": .005, "max_far_h_increase": 0.}.items():
         p.add_argument("--"+name.replace("_", "-"), type=float, default=value)
-    for name, value in asdict(abc.contrastive.LossSettings()).items():
+    for name, value in asdict(loss_ops.LossSettings()).items():
         p.add_argument("--"+name.replace("_", "-"), type=type(value), default=value)
     p.add_argument("--check-only", action="store_true")
     args = p.parse_args(argv)
@@ -349,7 +348,7 @@ def parse_args(argv=None):
     if args.max_far_h_increase > 1:
         p.error("max-far-h-increase must be <= 1")
     try:
-        abc.contrastive.loss_settings(args)
+        loss_ops.loss_settings(args)
     except ValueError as error:
         p.error(str(error))
     args.source_run = args.source_run.expanduser().resolve()
@@ -373,7 +372,7 @@ def main(argv=None):
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     print("기존 임베딩·사람 단위 분할·등록/질의 쌍을 확인합니다.", flush=True)
-    data, users, pairs, source, hashes = previous.prepare_source(args)
+    data, users, pairs, source, hashes = provenance.prepare_source(args)
     if args.output_dir.is_relative_to(data.directory.resolve()):
         raise ValueError("Output cannot be inside input embeddings")
     if args.check_only:

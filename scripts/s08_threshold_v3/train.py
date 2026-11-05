@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Joint Thresholding V3: four output designs on frozen cached embeddings.
 
-No feature extraction, BCH/FE decoding, reliability fitting or Fusion training.
---check-only reads and validates inputs without creating outputs or training.
+No feature extraction, BCH/FE decoding, reliability fitting or Fusion train_ops.
+--check-only reads and validates inputs without creating outputs or train_ops.
 """
 from collections import defaultdict
 from dataclasses import asdict
@@ -20,16 +20,27 @@ import traceback
 
 import numpy as np
 import torch
-from torch.nn import functional as F
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts import train_thresholding_reliability_abc as previous
-from scripts import train_thresholding_abcd as contrastive
-from scripts.train_reliability_distance import roc_auc
+from scripts import common
+from scripts.common import data as protocol, losses as loss_ops, metrics as metric_ops, training as train_ops, provenance
+from scripts.common.bch_evaluator import BCHEvaluator
+from Thresholding_Model_512 import ThresholdingModel512
+MODALITIES = common.MODALITIES
+ste = loss_ops.ste
+hamming = loss_ops.hamming
+negative_loss = loss_ops.negative_loss
+loss_function = loss_ops.joint_threshold_loss
+unique_indices = metric_ops.unique_indices
+evaluation_plan = metric_ops.joint_evaluation_plan
+distance_stats = metric_ops.distance_stats
+summarize = metric_ops.summarize_joint
+selection_guard = metric_ops.joint_selection_guard
+better = metric_ops.joint_better
 
-common = previous.common
+
 MODALITIES = common.MODALITIES
 MODEL_PATH = ROOT / "Thresholding Model V3.py"
 spec = importlib.util.spec_from_file_location("thresholding_model_v3", MODEL_PATH)
@@ -68,86 +79,6 @@ def forward_pair(model, cache, rows):
     return forward_model(model, ef, ep), forward_model(model, qf, qp)
 
 
-def ste(soft, hard):
-    return hard.to(soft.dtype).detach() + (soft - soft.detach())
-
-
-def hamming(a, b, matrix=False):
-    if matrix:
-        return a.sum(1)[:, None] + b.sum(1)[None, :] - 2*(a @ b.T)
-    return (a + b - 2*a*b).sum(1)
-
-
-def negative_loss(distance, labels, margin, hard_k, hard_mix):
-    identities, inverse, counts = torch.unique(labels, return_inverse=True, return_counts=True)
-    if len(identities) < 2:
-        raise ValueError("Each batch needs at least two identities per modality")
-    penalty = (F.relu(margin-distance)/margin).square()
-    membership = F.one_hot(inverse, len(identities)).to(distance.dtype)
-    grouped = penalty @ (membership/counts.to(distance.dtype))
-    valid = labels[:, None] != identities[None, :]
-    ordinary = (grouped*valid).sum(1)/valid.sum(1)
-    closest = torch.full_like(grouped, float("inf")).scatter_reduce(
-        1, inverse[None, :].expand(len(labels), -1), distance, reduce="amin", include_self=True)
-    hard = closest.masked_fill(~valid, float("inf")).topk(min(hard_k, len(identities)-1), largest=False).values
-    weights = contrastive.balanced_weights(labels)
-    return ((1-hard_mix)*ordinary + hard_mix*(F.relu(margin-hard)/margin).square().mean(1)).dot(weights)
-
-
-def loss_function(model, e, q, rows, users, args):
-    labels = contrastive.identity_codes(rows, users, e["face_soft_bits"].device)
-    terms, losses = defaultdict(list), {}
-    for m in MODALITIES:
-        eb, qb = (ste(out[m+"_soft_bits"], out[m+"_bits"]) for out in (e, q))
-        weights = contrastive.balanced_weights(labels[m])
-        d = hamming(eb, qb)
-        positive = ((F.relu(d-(args.bch_t-args.safety_margin))/args.bch_t).square()*weights).sum()
-        negative = negative_loss(hamming(eb, qb, matrix=True), labels[m],
-            getattr(args, m+"_margin_bits"), args.hard_k, args.hard_mix)
-        balance = sum(((weights[:, None]*b).sum(0)-.5).square().mean() for b in (eb, qb))/2
-        row = sum(contrastive.row_penalty(b, weights, args.row_lower) for b in (eb, qb))/2
-        residual = sum(((out[m+"_delta_tau"]/model.config.tau_delta_bound).square().mean(1)*weights).sum()
-                       for out in (e, q))/2
-        # Different tau can compensate noise; do not force tau agreement.
-        for key, val in {"positive": positive, "negative": negative, "balance": balance,
-                         "row": row, "residual": residual}.items():
-            terms[key].append(val)
-            losses[m+"_"+key] = val
-        losses[m+"_hamming_bits"] = (d.detach()*weights).sum()
-    losses.update({key: torch.stack(values).mean() for key, values in terms.items()})
-    losses["total"] = (losses["positive"] + args.negative_weight*losses["negative"]
-                       + args.balance_weight*losses["balance"] + args.row_weight*losses["row"]
-                       + args.residual_weight*losses["residual"])
-    return losses
-
-
-def unique_indices(values):
-    return np.sort(np.unique(values, axis=0, return_index=True)[1])
-
-
-def evaluation_plan(rows, users):
-    # Preserve different companion contexts even when one image pair repeats.
-    rows = rows[unique_indices(rows[:, :4])]
-    labels = {m: x.numpy() for m, x in contrastive.identity_codes(rows, users, "cpu").items()}
-    people = {"face": np.array([users[int(i)].face_person for i in rows[:, common.USER]]),
-              "fingerprint": np.array([users[int(i)].fingerprint_person for i in rows[:, common.USER]])}
-    anchors = unique_indices(rows[:, [common.EF, common.EP]])
-    queries = unique_indices(rows[:, [common.QF, common.QP]])
-    weights = {m: contrastive.balanced_weights(torch.from_numpy(labels[m])).numpy() for m in MODALITIES}
-    swaps = {}
-    for m in MODALITIES:
-        choices = []
-        for i, label in enumerate(labels[m]):
-            candidates = (np.arange(1, len(rows)+1)+i) % len(rows)
-            valid = candidates[labels[m][candidates] != label]
-            if not len(valid):
-                raise ValueError(f"No different-{m}-identity probe for swap diagnostics")
-            choices.append(valid[0])
-        swaps[m] = np.array(choices, dtype=np.int64)
-    return {"rows": rows, "labels": labels, "people": people, "anchors": anchors,
-            "queries": queries, "weights": weights, "swaps": swaps}
-
-
 @torch.no_grad()
 def collect(model, cache, rows, args, on_batch=None):
     model.eval()
@@ -162,64 +93,6 @@ def collect(model, cache, rows, args, on_batch=None):
         if on_batch:
             on_batch(step)
     return tuple({key: torch.cat(parts) for key, parts in dest.items()} for dest in collected)
-
-
-def distance_stats(values, t):
-    return {"pair_count": int(len(values)), "mean_hamming_bits": float(np.mean(values)) if len(values) else None,
-            "p05_hamming_bits": float(np.quantile(values, .05)) if len(values) else None,
-            "within_radius_count": int((values <= t).sum()),
-            "FAR_h": float((values <= t).mean()) if len(values) else None}
-
-
-def summarize(e, q, plan, args, tau_bound):
-    rows, metrics, within = plan["rows"], {}, []
-    ei, qi = plan["anchors"], plan["queries"]
-    observations = np.concatenate((rows[:, [common.EF, common.EP]], rows[:, [common.QF, common.QP]]))
-    oi = unique_indices(observations)
-    for m, cols in (("face", [common.EF, common.QF]), ("fingerprint", [common.EP, common.QP])):
-        eb, qb = e[m+"_bits"].float(), q[m+"_bits"].float()
-        d = (eb != qb).sum(1).numpy()
-        ok = d <= args.bch_t
-        within.append(ok)
-        distances = hamming(eb[ei], qb[qi], matrix=True).numpy()
-        distinct = plan["labels"][m][ei, None] != plan["labels"][m][None, qi]
-        same_person = plan["people"][m][ei, None] == plan["people"][m][None, qi]
-        masks = {"all_different_identities": distinct, "different_people": ~same_person}
-        if m == "fingerprint":
-            masks["same_person_different_fingers"] = same_person & distinct
-        scopes = {name: distance_stats(distances[mask], args.bch_t) for name, mask in masks.items()}
-        negatives = distances[distinct]
-        bits = torch.cat((eb, qb))[oi]
-        obs_labels = np.concatenate((plan["labels"][m], plan["labels"][m]))[oi]
-        obs_weights = contrastive.balanced_weights(torch.from_numpy(obs_labels))
-        coordinate = (bits*obs_weights[:, None]).sum(0)
-        row = bits.mean(1)
-        tau = torch.cat((e[m+"_tau"], q[m+"_tau"]))[oi]
-        # Equal image-pair weights, retaining ALL companion contexts per pair.
-        _, inverse, counts = np.unique(rows[:, cols], axis=0, return_inverse=True, return_counts=True)
-        image_weights = 1/(len(counts)*counts[inverse])
-        weights = plan["weights"][m].astype(np.float64)
-        weights /= weights.sum()
-        metrics[m] = {"context_pair_count": len(d), "genuine_hamming_bits": float(d.mean()),
-            "genuine_hamming_p95_bits": float(np.quantile(d, .95)), "within_radius_count": int(ok.sum()),
-            "within_radius_fraction": float(ok.mean()), "within_target_fraction": float((d <= args.bch_t-args.safety_margin).mean()),
-            "zero_error_fraction": float((d == 0).mean()),
-            "identity_macro_hamming_bits": float(d@weights), "identity_macro_within_radius_fraction": float(ok@weights),
-            "image_pair_count": len(counts), "image_pair_context_mean_hamming_bits": float(d@image_weights),
-            "image_pair_context_within_radius_fraction": float(ok@image_weights),
-            "genuine_vs_impostor_auroc": roc_auc(np.r_[np.ones(len(d), bool), np.zeros(len(negatives), bool)], -np.r_[d, negatives]),
-            "ones_fraction": float((row*obs_weights).sum()),
-            "coordinate_balance_error": float((coordinate-.5).square().mean()),
-            "constant_coordinate_fraction": float(((bits.min(0).values == 1) | (bits.max(0).values == 0)).float().mean()),
-            "outside_row_band_fraction": float((((row < args.row_lower) | (row > 1-args.row_lower)).float()*obs_weights).sum()),
-            "tau_mean_absolute": float(tau.abs().mean()), "tau_across_contexts_std_mean": float(tau.std(0, unbiased=False).mean()),
-            "tau_genuine_mean_absolute_difference": float((e[m+"_tau"]-q[m+"_tau"]).abs().mean()),
-            "tau_bound_saturation_fraction": float((tau.abs() >= .98*tau_bound).float().mean()),
-            "negative_scopes": scopes}
-    return {"modalities": metrics, "context_pair_count": len(rows),
-            "both_within_radius_fraction": float((within[0] & within[1]).mean()),
-            PRIMARY: sum(metrics[m]["identity_macro_within_radius_fraction"] for m in MODALITIES)/2,
-            "mean_identity_macro_hamming_bits": sum(metrics[m]["identity_macro_hamming_bits"] for m in MODALITIES)/2}
 
 
 @torch.no_grad()
@@ -267,35 +140,6 @@ def evaluate(model, cache, plan, args, on_batch=None):
     return result, e, q
 
 
-def selection_guard(candidate, baseline, args):
-    reasons = []
-    for m in MODALITIES:
-        c, b = candidate["modalities"][m], baseline["modalities"][m]
-        for key, tolerance in (("genuine_vs_impostor_auroc", args.max_auroc_drop),
-                               ("identity_macro_within_radius_fraction", args.max_radius_drop)):
-            if c[key] < b[key]-tolerance-1e-9:
-                reasons.append(f"{m}.{key} decreased by more than {tolerance}")
-        for key, tolerance in (("coordinate_balance_error", args.max_balance_increase),
-                               ("constant_coordinate_fraction", args.max_constant_increase),
-                               ("outside_row_band_fraction", args.max_row_outside_increase)):
-            if c[key] > b[key]+tolerance+1e-9:
-                reasons.append(f"{m}.{key} increased by more than {tolerance}")
-        for scope in c["negative_scopes"]:
-            cv, bv = (v["negative_scopes"][scope]["FAR_h"] for v in (c, b))
-            if cv is not None and cv > bv+args.max_far_h_increase+1e-12:
-                reasons.append(f"{m}.{scope}.FAR_h increased")
-        cv, bv = (v["swaps"]["wrong_"+m]["changed_identity_macro_FAR_h"] for v in (candidate, baseline))
-        if cv > bv+args.max_far_h_increase+1e-12:
-            reasons.append(f"wrong_{m}.FAR_h increased")
-    return not reasons, reasons
-
-
-def better(candidate, best, args):
-    if abs(candidate[PRIMARY]-best[PRIMARY]) > 1e-12:
-        return candidate[PRIMARY] > best[PRIMARY]
-    return candidate["mean_identity_macro_hamming_bits"] < best["mean_identity_macro_hamming_bits"]-args.min_bit_gain
-
-
 @torch.no_grad()
 def initial_digest(model, cache, rows):
     digest = hashlib.sha256()
@@ -322,7 +166,7 @@ def train_trial(model, mode, seed, data, users, cache, plan, baseline, args, fol
     progress = common.Progress(f"V3/{mode} seed={seed}", args.epochs, future, args.log_interval)
     for epoch in range(1, args.epochs+1):
         model.train()
-        batches, padding = previous.make_schedule(data, users, args, seed, epoch, "threshold", schedules)
+        batches, padding = train_ops.make_schedule(data, users, args, seed, epoch, "threshold", schedules)
         steps = len(batches) + 3*math.ceil(len(plan["rows"])/args.batch_size)
         sums, count = defaultdict(float), 0
         for step, (rows, _) in enumerate(batches, 1):
@@ -436,13 +280,9 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
     try:
         common.write_json(args.output_dir/"status.json", {"state": "running", "synthetic_test_only": synthetic})
         if not synthetic:
-            for name in previous.MANIFESTS:
+            for name in protocol.MANIFESTS:
                 shutil.copy2(args.source_run/name, args.output_dir/name)
-        paths = [Path(__file__), MODEL_PATH, Path(previous.__file__), Path(common.__file__),
-                 Path(contrastive.__file__), ROOT/"scripts/train_reliability_distance.py"]
-        if "independent_512" in args.modes:
-            paths += [ROOT/"Thresholding_Model_512.py", ROOT/"thresholding/variability_model.py"]
-        code_hashes = {str(p): common.sha256(p) for p in paths}
+        code_hashes = provenance.code_hashes(__file__)
         config = {**{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             "started_at_utc": datetime.now(timezone.utc).isoformat(), "torch": str(torch.__version__),
             "synthetic_test_only": synthetic, "input_sha256": data.hashes, "source_sha256": source_hashes,
@@ -603,7 +443,7 @@ def main(argv=None):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
-    data, users, pairs, source, hashes = previous.prepare_source(args)
+    data, users, pairs, source, hashes = provenance.prepare_source(args)
     if args.output_dir.is_relative_to(data.directory.resolve()):
         raise ValueError("Output must not be inside the embedding directory")
     if args.check_only:
@@ -622,4 +462,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-

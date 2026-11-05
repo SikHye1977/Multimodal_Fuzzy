@@ -18,7 +18,7 @@ A/B는 학습 파라미터가 없으므로 각 한 번 평가한다. C의 seed �
 
 ```bash
 cd /home/uxm2/hsh/2026_2/multimodal_biometric
-bash feature_extractors/run.sh scripts/train_thresholding_multisample_abc.py \
+bash feature_extractors/run.sh -m scripts.s09_multisample.train \
   --device cuda --seeds 17 29 43 --epochs 100 --patience 20 \
   --enroll-captures 5 --query-captures 1
 ```
@@ -27,14 +27,14 @@ bash feature_extractors/run.sh scripts/train_thresholding_multisample_abc.py \
 
 ```bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  scripts/train_thresholding_multisample_abc.py --check-only
+  -m scripts.s09_multisample.train --check-only
 ```
 
 별도 실험으로 등록 3장·질의 3장을 비교하려면:
 
 ```bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  scripts/train_thresholding_multisample_abc.py --device cuda \
+  -m scripts.s09_multisample.train --device cuda \
   --enroll-captures 3 --query-captures 3 --seeds 17 29 43
 ```
 
@@ -168,7 +168,7 @@ FE 보조정보를 그 규칙으로 다시 생성해야 한다.
 
 ```bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  -m unittest scripts.tests.test_thresholding_multisample_abc -v
+  -m unittest scripts.tests.test_multisample -v
 ```
 
 합성 임베딩만 사용하는 CPU 검증이다. 샘플 분리, 순서 불변 통계, 한 장의 결측

@@ -13,8 +13,8 @@ import textwrap
 import numpy as np
 import torch
 
-from scripts import train_thresholding_bch_abc as ex
-from scripts.tests.test_thresholding_reliability_abc import synthetic_data
+from scripts.s06_bch_loss_abc import train as ex
+from scripts.tests.helpers import synthetic_data
 
 
 class FusionFreeImportTests(unittest.TestCase):
@@ -26,7 +26,10 @@ class FusionFreeImportTests(unittest.TestCase):
             import importlib.abc
             import sys
 
-            forbidden = {"Fusion_Encoder", "Fusion_Decoder", "scripts.train_fusion"}
+            forbidden = {"Fusion_Encoder", "Fusion_Decoder", "scripts.train_fusion",
+                         "scripts.train_thresholding", "scripts.train_reliability_distance",
+                         "scripts.train_thresholding_abcd", "scripts.train_thresholding_architectures",
+                         "scripts.train_thresholding_ablation", "scripts.train_thresholding_reliability_abc"}
 
             class BlockFusion(importlib.abc.MetaPathFinder):
                 def find_spec(self, fullname, path=None, target=None):
@@ -36,13 +39,13 @@ class FusionFreeImportTests(unittest.TestCase):
 
             sys.meta_path.insert(0, BlockFusion())
             for name in (
-                "train_thresholding_512", "train_thresholding_bch_abc",
-                "train_thresholding_c_fixed_dynamic", "train_thresholding_v3",
-                "train_thresholding_multisample_abc",
+                "s05_threshold512.train", "s06_bch_loss_abc.train",
+                "s07_fixed_dynamic.train", "s08_threshold_v3.train",
+                "s09_multisample.train",
             ):
                 importlib.import_module("scripts." + name)
-            from scripts.bch_evaluator import BCHEvaluator
-            from scripts.train_thresholding_bch_abc import BCHEvaluator as used
+            from scripts.common.bch_evaluator import BCHEvaluator
+            from scripts.s06_bch_loss_abc.train import BCHEvaluator as used
             assert used is BCHEvaluator
             assert not forbidden.intersection(sys.modules)
         """)
@@ -74,11 +77,11 @@ class BCHABCTests(unittest.TestCase):
         self.cache = {m: torch.from_numpy(x.copy()) for m, x in self.data.arrays.items()}
 
     def test_a_is_exact_original_loss(self):
-        model = ex.base.make_model(self.args, "dynamic", 17).set_stage("threshold")
+        model = ex.train_ops.make_coordinate_model(self.args, "dynamic", 17).set_stage("threshold")
         rows = self.pairs["train"]
         e, q = ex.quantize_pair(model, self.cache, rows)
         actual = ex.threshold_loss(model, e, q, rows, self.users, self.args, "A")
-        expected = ex.base.threshold_loss(model, e, q, rows, self.users, self.args)
+        expected = ex.loss_ops.coordinate_threshold_loss(model, e, q, rows, self.users, self.args)
         self.assertEqual(actual.keys(), expected.keys())
         for key in actual:
             torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
@@ -126,7 +129,7 @@ class BCHABCTests(unittest.TestCase):
         e, q = (torch.rand((5, 512), generator=generator) for _ in range(2))
         labels = torch.tensor([0, 0, 1, 2, 2])
         distances = torch.cdist(e, q, p=1) / 512
-        expected = ex.contrastive.mined_negative(e, q, labels, .4, 4, .5)
+        expected = ex.loss_ops.mined_negative(e, q, labels, .4, 4, .5)
         actual = ex.mined_negative(distances, labels, .4, 4, .5)
         altered = distances.masked_fill(labels[:, None] == labels[None, :], 0)
         other = ex.mined_negative(altered, labels, .4, 4, .5)
@@ -137,7 +140,7 @@ class BCHABCTests(unittest.TestCase):
     def test_both_hard_arms_backprop_only_thresholds(self):
         for mode in ("fixed", "dynamic"):
             for arm in ("B", "C"):
-                model = ex.base.make_model(self.args, mode, 17).set_stage("threshold")
+                model = ex.train_ops.make_coordinate_model(self.args, mode, 17).set_stage("threshold")
                 e, q = ex.quantize_pair(model, self.cache, self.pairs["train"])
                 losses = ex.threshold_loss(model, e, q, self.pairs["train"], self.users, self.args, arm)
                 losses["total"].backward()
@@ -159,8 +162,8 @@ class BCHABCTests(unittest.TestCase):
         # Multiple fingers of ONE participant; no different-person FAR exists.
         users = [replace(u, fingerprint_person="one", finger_id=u.face_person) for u in self.users]
         rows = np.concatenate([self.pairs["validation"], self.pairs["validation"][:2]])
-        model = ex.base.make_model(self.args, "fixed", 17)
-        e, q = ex.previous.collect(model, self.cache, rows, 4)
+        model = ex.train_ops.make_coordinate_model(self.args, "fixed", 17)
+        e, q = ex.train_ops.collect(model, self.cache, rows, 4)
         result = ex.negative_diagnostics(e, q, rows, users, "fingerprint", 32)
         self.assertEqual(result["different_people"]["pair_count"], 0)
         self.assertIsNone(result["different_people"]["FAR_h"])
@@ -170,9 +173,9 @@ class BCHABCTests(unittest.TestCase):
         self.assertEqual(result, original)
 
     def test_wrong_candidate_never_counts_as_exact_recovery(self):
-        model = ex.base.make_model(self.args, "fixed", 17)
+        model = ex.train_ops.make_coordinate_model(self.args, "fixed", 17)
         rows = self.pairs["validation"]
-        plan = ex.contrastive.evaluation_plan(rows, self.users, "cpu")
+        plan = ex.metric_ops.evaluation_plan(rows, self.users, "cpu")
         class FakeBCH:
             def recover(self, e, q):
                 return np.where(np.count_nonzero(e != q, axis=1) <= 32, 1, 2).astype(np.uint8)

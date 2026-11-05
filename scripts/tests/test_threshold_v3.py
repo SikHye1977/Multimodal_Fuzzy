@@ -11,8 +11,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from scripts import train_thresholding_v3 as ex
-from scripts.tests.test_thresholding_reliability_abc import synthetic_data
+from scripts.s08_threshold_v3 import train as ex
+from scripts.tests.helpers import synthetic_data
 
 
 class ThresholdingV3Tests(unittest.TestCase):
@@ -242,7 +242,7 @@ class ThresholdingV3Tests(unittest.TestCase):
 
     def test_check_only_never_starts_optimizer_or_creates_output(self):
         self.data.directory = Path(self.tmp.name)/"inputs"
-        with patch.object(ex.previous, "prepare_source", return_value=(self.data, self.users, self.pairs, {"seed": 17}, {})), \
+        with patch.object(ex.provenance, "prepare_source", return_value=(self.data, self.users, self.pairs, {"seed": 17}, {})), \
              patch.object(ex, "run", side_effect=AssertionError("must not run")), \
              patch.object(torch.optim, "Adam", side_effect=AssertionError("must not optimize")), redirect_stdout(io.StringIO()):
             ex.main(["--check-only", "--output-dir", str(self.args.output_dir)])

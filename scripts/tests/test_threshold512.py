@@ -10,8 +10,8 @@ import numpy as np
 import torch
 
 from Thresholding_Model_512 import ThresholdingModel512, Thresholding512Config, MODES, MODALITIES
-from scripts import train_thresholding_512 as ex
-from scripts.tests.test_thresholding_reliability_abc import synthetic_data
+from scripts.s05_threshold512 import train as ex
+from scripts.tests.helpers import synthetic_data
 
 
 class Threshold512Tests(unittest.TestCase):
@@ -101,22 +101,22 @@ class Threshold512Tests(unittest.TestCase):
 
     def test_reliability_cannot_change_thresholds(self):
         model=self.model('dynamic')
-        stats=ex.previous.fit_statistics(model,self.cache,self.data,self.users,self.pairs['train'],self.args)
+        stats=ex.train_ops.fit_statistics(model,self.cache,self.data,self.users,self.pairs['train'],self.args)
         for m in MODALITIES:
             model.reliability[m].set_statistics(stats[m])
         model.set_stage('reliability')
         frozen=model.fixed_reliability_state()
         optimizer=torch.optim.Adam([p for p in model.parameters() if p.requires_grad],lr=.01)
         e,q=ex.common.forward_pair(model,self.cache,self.pairs['train'][:4])
-        ex.previous.reliability_loss(e,q).backward()
+        ex.loss_ops.reliability_loss(e,q).backward()
         optimizer.step()
-        ex.previous.assert_fixed(model,frozen)
+        ex.train_ops.assert_fixed(model,frozen)
         # Even a caller who accidentally unfreezes tau cannot backprop BCE to it.
         for p in model.parameters():
             p.grad=None
             p.requires_grad_(True)
         e,q=ex.common.forward_pair(model,self.cache,self.pairs['train'][:4])
-        ex.previous.reliability_loss(e,q).backward()
+        ex.loss_ops.reliability_loss(e,q).backward()
         self.assertTrue(all(p.grad is None for p in model.thresholds.parameters()))
 
     def test_invalid_inputs_and_checkpoint_round_trip(self):
@@ -142,9 +142,9 @@ class Threshold512Tests(unittest.TestCase):
 
     def test_collapse_guard_and_tau_statistics(self):
         rows=self.pairs['validation']
-        plan=ex.contrastive.evaluation_plan(rows,self.users,'cpu')
+        plan=ex.metric_ops.evaluation_plan(rows,self.users,'cpu')
         model=self.model('zero')
-        e,q=ex.previous.collect(model,self.cache,rows,4)
+        e,q=ex.train_ops.collect(model,self.cache,rows,4)
         baseline=ex.bit_metrics(e,q,plan,self.args)
         self.assertTrue(ex.selection_guard(baseline,baseline,self.args)[0])
         candidate=json.loads(json.dumps(baseline))
@@ -189,7 +189,7 @@ class Threshold512Tests(unittest.TestCase):
             model=self.model('dynamic').set_stage(stage)
             e,q=ex.common.forward_pair(model,cache,rows)
             loss=(ex.threshold_loss(model,e,q,rows,self.users,self.args)['total'] if stage=='threshold'
-                  else ex.previous.reliability_loss(e,q))
+                  else ex.loss_ops.reliability_loss(e,q))
             loss.backward()
             self.assertTrue(torch.isfinite(loss))
 

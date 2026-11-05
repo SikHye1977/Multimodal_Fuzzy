@@ -1,6 +1,6 @@
 # C 손실 고정: fixed / dynamic 512차원 tau 비교
 
-`train_thresholding_c_fixed_dynamic.py`는 기존 C 손실을 그대로 호출하면서 임계값 구조 두 가지를 비교한다.
+`scripts/s07_fixed_dynamic/train.py`는 기존 C 손실을 그대로 호출하면서 임계값 구조 두 가지를 비교한다.
 기존 `Thresholding_Model_512.py`를 사용하며, 얼굴과 지문은 각각 별도 모델 파라미터를 갖는다.
 
 | 구조 | 각 모달리티의 tau |
@@ -16,7 +16,7 @@ dynamic은 등록과 질의 각각의 현재 임베딩만으로 tau를 예측한
 
 ```bash
 cd /home/uxm2/hsh/2026_2/multimodal_biometric
-bash feature_extractors/run.sh scripts/train_thresholding_c_fixed_dynamic.py \
+bash feature_extractors/run.sh -m scripts.s07_fixed_dynamic.train \
   --device cuda --seeds 17 29 43 \
   --bch-t 32 --safety-margin 4 --epochs 100 --patience 15
 ```
@@ -28,7 +28,7 @@ bash feature_extractors/run.sh scripts/train_thresholding_c_fixed_dynamic.py \
 입력 확인만 할 때는 다음을 사용한다. 파일 생성, 환경 변경, 학습은 수행하지 않는다.
 
 ```bash
-bash feature_extractors/run.sh scripts/train_thresholding_c_fixed_dynamic.py --check-only
+bash feature_extractors/run.sh -m scripts.s07_fixed_dynamic.train --check-only
 ```
 
 ## 손실과 성공 기준
@@ -74,5 +74,5 @@ dynamic이 실제로 입력에 따라 움직이는지는 `tau_across_unique_imag
 합성 검증 명령(실제 데이터 학습 없음):
 
 ```bash
-bash feature_extractors/run.sh -m unittest scripts.tests.test_thresholding_c_fixed_dynamic -v
+bash feature_extractors/run.sh -m unittest scripts.tests.test_fixed_dynamic -v
 ```

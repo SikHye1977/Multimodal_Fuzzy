@@ -14,7 +14,7 @@ import subprocess
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+from .paths import ROOT
 
 
 class BCHEvaluator:
@@ -28,9 +28,9 @@ class BCHEvaluator:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         # Retain the existing C bridge and ABI; neither imports a Fusion model.
-        library = directory / "fusion_bch.so"
+        library = directory / "bch.so"
         command = [compiler, "-std=c++17", "-O2", "-shared", "-fPIC", "-I", str(ROOT / "BCH"),
-                   str(ROOT / "scripts/fusion_bch_bridge.cpp"), str(ROOT / "BCH/BCH.cpp"), "-o", str(library)]
+                   str(ROOT / "scripts/common/bch_bridge.cpp"), str(ROOT / "BCH/BCH.cpp"), "-o", str(library)]
         built = subprocess.run(command, capture_output=True, text=True)
         (directory / "compiler.log").write_text(built.stdout + built.stderr, encoding="utf-8")
         if built.returncode:

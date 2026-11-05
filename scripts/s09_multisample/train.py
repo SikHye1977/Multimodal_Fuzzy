@@ -3,7 +3,7 @@
 
 Defaults: 5 enrollment captures and 1 query capture per modality. Only C trains.
 Uses frozen caches, original person splits and virtual mappings. No extraction,
-BCH/FE decoding, or Fusion training. --check-only creates no output or optimizer.
+BCH/FE decoding, or Fusion train_ops. --check-only creates no output or optimizer.
 """
 from collections import defaultdict
 from dataclasses import asdict
@@ -21,14 +21,18 @@ import traceback
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from Thresholding_Model_Set import SetThresholdConfig, SetThresholdingModel, set_statistics
-from scripts import train_thresholding_v3 as v3
+from scripts import common
+from scripts.common import data as protocol, losses as loss_ops, metrics as metric_ops, provenance
+from scripts.common.bch_evaluator import BCHEvaluator
+MODALITIES = common.MODALITIES
+PRIMARY = metric_ops.PRIMARY
 
-common, previous = v3.common, v3.previous
-MODALITIES, PRIMARY = v3.MODALITIES, v3.PRIMARY
+
+from Thresholding_Model_Set import SetThresholdConfig, SetThresholdingModel, set_statistics
+
 DESCRIPTIONS = {
     "A": "One designated capture from each matched enrollment/query set, tau=0",
     "B": "L2-normalized mean of all captures in each set, tau=0",
@@ -96,7 +100,7 @@ are strictly disjoint. A's designated capture is the first member of each set.
                     row.extend((index(m, enrollment), index(m, query)))
                 rows.append((*row, ui))
     rows = np.asarray(rows, dtype=np.int64)
-    plan = v3.evaluation_plan(rows, users)
+    plan = metric_ops.joint_evaluation_plan(rows, users)
     plan.update(split=split, members=members, epoch=epoch)
     coverage = {}
     for m, columns in (("face", (common.EF, common.QF)), ("fingerprint", (common.EP, common.QP))):
@@ -173,7 +177,7 @@ def evaluate(model, arm, bank, plan, args, on_batch=None):
         if on_batch:
             on_batch(step)
     e, q = ({k: torch.cat(v) for k, v in out.items()} for out in collected)
-    result = v3.summarize(e, q, plan, args, args.tau_base_bound+args.tau_delta_bound)
+    result = metric_ops.summarize_joint(e, q, plan, args, args.tau_base_bound+args.tau_delta_bound)
     # IDs here refer to sample sets, not individual images as in the V3 trainer.
     for metrics in result["modalities"].values():
         for key in list(metrics):
@@ -274,7 +278,7 @@ def train_trial(model, seed, data, users, validation_plan, validation_bank, base
         for step, (rows, _) in enumerate(batches, 1):
             optimizer.zero_grad(set_to_none=True)
             e, q = forward_pair(model, "C", bank, rows)
-            losses = v3.loss_function(model, e, q, rows, users, args)
+            losses = loss_ops.joint_threshold_loss(model, e, q, rows, users, args)
             if not all(bool(torch.isfinite(v)) for v in losses.values()):
                 raise RuntimeError("Nonfinite loss")
             losses["total"].backward()
@@ -287,8 +291,8 @@ def train_trial(model, seed, data, users, validation_plan, validation_bank, base
             progress.update(epoch, step, total_steps, "train", sums["total"]/count)
         metrics, _, _ = evaluate(model, "C", validation_bank, validation_plan, args,
             lambda k: progress.update(epoch, len(batches)+k, total_steps, "validation+swap", sums["total"]/count))
-        eligible, reasons = v3.selection_guard(metrics, baseline, args)
-        selected = eligible and v3.better(metrics, best, args)
+        eligible, reasons = metric_ops.joint_selection_guard(metrics, baseline, args)
+        selected = eligible and metric_ops.joint_better(metrics, best, args)
         if selected:
             best, best_epoch, stale = metrics, epoch, 0
             model.save_checkpoint(folder/"best_threshold.pt", {**metadata, "epoch": epoch, "origin": "trained"})
@@ -366,14 +370,11 @@ def run(args, data, users, source_hashes, *, synthetic=False):
     log, current = common.Log(args.output_dir), None
     try:
         common.write_json(args.output_dir/"status.json", {"state": "running", "synthetic_test_only": synthetic})
-        paths = [Path(__file__), ROOT/"Thresholding_Model_Set.py", Path(v3.__file__), Path(common.__file__),
-                 Path(previous.__file__), Path(v3.contrastive.__file__), ROOT/"Thresholding Model V3.py",
-                 ROOT/"scripts/train_reliability_distance.py"]
-        code_hashes = {str(p): common.sha256(p) for p in paths}
+        code_hashes = provenance.code_hashes(__file__)
         if not synthetic:
             original = args.output_dir/"source_manifests"
             original.mkdir()
-            for name in previous.MANIFESTS:
+            for name in protocol.MANIFESTS:
                 shutil.copy2(args.source_run/name, original/name)
         config = {**{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   "started_at_utc": datetime.now(timezone.utc).isoformat(), "torch": str(torch.__version__),
@@ -546,7 +547,7 @@ def main(argv=None):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
-    data, users, _, source, source_hashes = previous.prepare_source(args)
+    data, users, _, source, source_hashes = provenance.prepare_source(args)
     args.data_seed = int(source["seed"])
     if args.output_dir.is_relative_to(data.directory.resolve()):
         raise ValueError("Output must not be inside the embedding directory")

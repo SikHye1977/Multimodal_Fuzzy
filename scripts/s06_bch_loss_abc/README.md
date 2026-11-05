@@ -1,6 +1,6 @@
 # 512차원 Threshold: soft / hard STE / BCH 손실 비교
 
-`train_thresholding_bch_abc.py`는 기존 `Thresholding_Model_512.py`와 저장된 얼굴·지문 임베딩을 사용한다.
+`scripts/s06_bch_loss_abc/train.py`는 기존 `Thresholding_Model_512.py`와 저장된 얼굴·지문 임베딩을 사용한다.
 특징 추출기, 원본 이미지, 기존 실험 결과 및 BCH 구현은 변경하지 않는다.
 
 | 실험 | 학습 중 비트 표현 | 동일 신원 손실 |
@@ -21,7 +21,7 @@ A는 이 항들도 soft bit로, B/C는 hard STE bit로 계산한다. 음성 쌍�
 
 ```bash
 cd /home/uxm2/hsh/2026_2/multimodal_biometric
-bash feature_extractors/run.sh scripts/train_thresholding_bch_abc.py \
+bash feature_extractors/run.sh -m scripts.s06_bch_loss_abc.train \
   --device cuda --arms A B C --modes fixed --seeds 17 29 43 \
   --bch-t 32 --safety-margin 4 --epochs 100 --patience 15
 ```
@@ -38,7 +38,7 @@ dynamic도 기존 설정(전역 tau ±0.01 + 입력별 residual ±0.01)을 사�
 학습 전 데이터와 실행 조건만 확인하려면:
 
 ```bash
-bash feature_extractors/run.sh scripts/train_thresholding_bch_abc.py --check-only
+bash feature_extractors/run.sh -m scripts.s06_bch_loss_abc.train --check-only
 ```
 
 이 명령은 학습·BCH 빌드·파일 생성을 하지 않는다. CUDA 사용이 불가능하면 실제 학습 명령은 오류로 종료하며,
@@ -52,8 +52,8 @@ CPU 실행을 원할 경우 명시적으로 `--device cpu`를 지정해야 한�
 ## 선택과 평가
 
 매 epoch 실제 512비트로 검증하며, 결과 폴더에 빌드한 기존 BCH 구현으로 등록 비트의 정확한 복원을 검사한다.
-Python 평가기는 `scripts/bch_evaluator.py`에 분리되어 있으며 Fusion Encoder/Decoder나
-`train_fusion.py`를 불러오지 않는다. `fusion_bch_bridge.cpp`는 기존 이름을 유지한 C++ 연결 코드로,
+Python 평가기는 `scripts/common/bch_evaluator.py`에 분리되어 있으며 Fusion Encoder/Decoder나
+`train_fusion.py`를 불러오지 않는다. `bch_bridge.cpp`는 기존 이름을 유지한 C++ 연결 코드로,
 Fusion 모델과 무관하다. 실행에는 C++17을 지원하는 `g++`가 필요하다.
 검증의 타인 거리·AUROC·비트 균형 악화 방지 조건과 `FAR_h` 증가 제한을 통과한 후보 중 다음 순서로 선택한다.
 
@@ -101,5 +101,5 @@ Hamming 거리는 `sum(b_e + b_q − 2*b_e*b_q)`로 계산한다.
 합성 데이터 테스트(실제 생체 데이터 학습 없음):
 
 ```bash
-bash feature_extractors/run.sh -m unittest scripts.tests.test_thresholding_bch_abc -v
+bash feature_extractors/run.sh -m unittest scripts.tests.test_bch_loss_abc -v
 ```

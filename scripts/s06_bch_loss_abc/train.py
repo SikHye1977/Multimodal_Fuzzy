@@ -2,7 +2,7 @@
 """A: soft bits; B: sigmoid STE + mean Hamming; C: STE + BCH-radius loss.
 
 Uses frozen cached embeddings and the original participant-disjoint split. The
-existing ThresholdingModel512 is unchanged. No reliability or Fusion training.
+existing ThresholdingModel512 is unchanged. No reliability or Fusion train_ops.
 Training is opt-in by invoking this script; --check-only never writes or trains.
 """
 from collections import defaultdict
@@ -21,16 +21,27 @@ import traceback
 
 import numpy as np
 import torch
-from torch.nn import functional as F
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from scripts import train_thresholding_512 as base
-from scripts.bch_evaluator import BCHEvaluator
+from scripts import common
+from scripts.common import data as protocol, losses as loss_ops, metrics as metric_ops, training as train_ops, provenance
+from scripts.common.bch_evaluator import BCHEvaluator
+from Thresholding_Model_512 import ThresholdingModel512
+MODALITIES = common.MODALITIES
+ste_bits = loss_ops.ste_bits
+xor_distance = loss_ops.xor_distance
+bch_positive = loss_ops.bch_positive
+mined_negative = loss_ops.mined_hamming_negative
+threshold_loss = loss_ops.bch_threshold_loss
+quantize_pair = train_ops.quantize_pair
+unique_indices = metric_ops.unique_indices
+negative_diagnostics = metric_ops.negative_diagnostics
+selection_guard = metric_ops.bch_selection_guard
+
 from Thresholding_Model_512 import ThresholdingModel512
 
-common, previous, contrastive = base.common, base.previous, base.contrastive
 MODALITIES = common.MODALITIES
 ARMS = ("A", "B", "C")
 DESCRIPTIONS = {
@@ -40,114 +51,6 @@ DESCRIPTIONS = {
 }
 
 
-def ste_bits(soft, hard):
-    """Exactly 0/1 in forward; sigmoid derivative in backward, not identity."""
-    return hard.to(soft.dtype).detach() + (soft - soft.detach())
-
-
-def xor_distance(e, q, matrix=False):
-    """Polynomial XOR equals Hamming for hard STE values, with gradients."""
-    if matrix:
-        return e.sum(1)[:, None] + q.sum(1)[None, :] - 2 * (e @ q.T)
-    return (e + q - 2 * e * q).sum(1)
-
-
-def bch_positive(distances, t, safety_margin):
-    return (F.relu(distances - (t - safety_margin)) / t).square().mean()
-
-
-def mined_negative(distances, labels, margin, hard_k, hard_mix):
-    """Same identity-balanced mining as the original, accepting Hamming / 512."""
-    identities, inverse, counts = torch.unique(labels, return_inverse=True, return_counts=True)
-    if len(identities) < 2:
-        raise ValueError("At least two identities are needed in each training batch")
-    penalty = (F.relu(margin - distances) / margin).square()
-    membership = F.one_hot(inverse, num_classes=len(identities)).to(distances.dtype)
-    group_mean = penalty @ (membership / counts.to(distances.dtype))
-    valid = labels[:, None] != identities[None, :]
-    ordinary_rows = (group_mean * valid).sum(1) / valid.sum(1)
-    minimum = torch.full_like(group_mean, float("inf")).scatter_reduce(
-        1, inverse[None, :].expand(len(labels), -1), distances, reduce="amin", include_self=True)
-    nearest = minimum.masked_fill(~valid, float("inf")).topk(
-        min(hard_k, len(identities) - 1), dim=1, largest=False).values
-    hard_rows = (F.relu(margin - nearest) / margin).square().mean(1)
-    weights = contrastive.balanced_weights(labels)
-    ordinary, hard = (ordinary_rows * weights).sum(), (hard_rows * weights).sum()
-    return (1 - hard_mix) * ordinary + hard_mix * hard, ordinary, hard
-
-
-def threshold_loss(model, e, q, rows, users, args, arm):
-    if arm == "A":
-        # Exact original implementation, including regularizers and mining.
-        return base.threshold_loss(model, e, q, rows, users, args)
-    if arm not in ("B", "C"):
-        raise ValueError(f"Unknown arm {arm}")
-    settings = contrastive.loss_settings(args)
-    labels = contrastive.identity_codes(rows, users, args.device)
-    terms = defaultdict(list)
-    for m in MODALITIES:
-        eb = ste_bits(e[f"{m}_soft_bits"], e[f"{m}_bits"])
-        qb = ste_bits(q[f"{m}_soft_bits"], q[f"{m}_bits"])
-        d = xor_distance(eb, qb)
-        positive = (d / 512).mean() if arm == "B" else bch_positive(d, args.bch_t, args.safety_margin)
-        neg, ordinary, hard = mined_negative(xor_distance(eb, qb, matrix=True) / 512,
-            labels[m], getattr(settings, m + "_margin"), settings.hard_k, settings.hard_mix)
-        weights = contrastive.balanced_weights(labels[m])
-        balance = sum(((weights[:, None] * b).sum(0) - .5).square().mean() for b in (eb, qb)) / 2
-        row = sum(contrastive.row_penalty(b, weights, settings.row_lower) for b in (eb, qb)) / 2
-        for key, value in {"positive": positive, "negative": neg, "negative_all": ordinary,
-                           "negative_hard": hard, "balance": balance, "row": row}.items():
-            terms[key].append(value)
-        terms[f"{m}_hard_hamming_bits"].append(d.detach().mean())
-        terms[f"{m}_above_target_fraction"].append((d.detach() > args.bch_t - args.safety_margin).float().mean())
-    loss = {key: torch.stack(values).mean() for key, values in terms.items()}
-    loss["tau_stability"] = torch.stack([
-        ((e[f"{m}_tau"] - q[f"{m}_tau"]) / model.config.tau_bound).square().mean() for m in MODALITIES]).mean()
-    loss["tau_residual"] = torch.stack([
-        (out[f"{m}_delta_tau"] / model.config.tau_delta_bound).square().mean()
-        for m in MODALITIES for out in (e, q)]).mean()
-    loss["total"] = (loss["positive"] + settings.negative_weight * loss["negative"]
-        + settings.balance_weight * loss["balance"] + settings.row_weight * loss["row"]
-        + args.tau_stability_weight * loss["tau_stability"] + args.tau_residual_weight * loss["tau_residual"])
-    return loss
-
-
-def quantize_pair(model, cache, rows):
-    ef, ep, qf, qp = common.model_inputs(cache, rows)
-    return tuple({f"{m}_{key}": value for m, x in zip(MODALITIES, inputs)
-                  for key, value in model.quantize(m, x).items()} for inputs in ((ef, ep), (qf, qp)))
-
-
-def unique_indices(values):
-    return np.sort(np.unique(values, axis=0, return_index=True)[1])
-
-
-def negative_diagnostics(e, q, rows, users, modality, t):
-    """Unique image pairs, excluding genuine identity; keep participant scopes."""
-    ec, qc = (common.EF, common.QF) if modality == "face" else (common.EP, common.QP)
-    ei, qi = unique_indices(rows[:, ec]), unique_indices(rows[:, qc])
-    eb, qb = e[f"{modality}_bits"][ei].float(), q[f"{modality}_bits"][qi].float()
-    distances = xor_distance(eb, qb, matrix=True).numpy()
-    eu, qu = [users[int(rows[i, common.USER])] for i in ei], [users[int(rows[i, common.USER])] for i in qi]
-    if modality == "face":
-        same_person = np.array([[a.face_person == b.face_person for b in qu] for a in eu])
-        different_identity = ~same_person
-    else:
-        same_person = np.array([[a.fingerprint_person == b.fingerprint_person for b in qu] for a in eu])
-        different_identity = np.array([[a.finger != b.finger for b in qu] for a in eu])
-    scopes = {"all_different_identities": different_identity, "different_people": ~same_person}
-    if modality == "fingerprint":
-        scopes["same_person_different_fingers"] = same_person & different_identity
-    result = {}
-    for name, mask in scopes.items():
-        values = distances[mask]
-        result[name] = {"pair_count": len(values), "mean_hamming_bits": float(values.mean()) if len(values) else None,
-            "p05_hamming_bits": float(np.quantile(values, .05)) if len(values) else None,
-            "within_t_count": int((values <= t).sum()),
-            "FAR_h": float((values <= t).mean()) if len(values) else None}
-    return result
-
-
 def evaluation_steps(rows, batch_size, bch_batch_size):
     return math.ceil(len(rows) / batch_size) + sum(math.ceil(len(unique_indices(rows[:, cols])) / bch_batch_size)
         for cols in ([common.EF, common.QF], [common.EP, common.QP]))
@@ -155,8 +58,8 @@ def evaluation_steps(rows, batch_size, bch_batch_size):
 
 @torch.no_grad()
 def evaluate(model, cache, rows, users, plan, args, bch, on_step=None):
-    e, q = previous.collect(model, cache, rows, args.batch_size, on_batch=on_step)
-    metrics = base.bit_metrics(e, q, plan, args)
+    e, q = train_ops.collect(model, cache, rows, args.batch_size, on_batch=on_step)
+    metrics = metric_ops.coordinate_bit_metrics(e, q, plan, args)
     metrics["unique_pairs"], outcomes = {}, {}
     step = math.ceil(len(rows) / args.batch_size)
     for m, cols in (("face", [common.EF, common.QF]), ("fingerprint", [common.EP, common.QP])):
@@ -190,16 +93,6 @@ def evaluate(model, cache, rows, users, plan, args, bch, on_step=None):
     return metrics, e, q, outcomes
 
 
-def selection_guard(metrics, baseline, args):
-    _, reasons = base.selection_guard(metrics, baseline, args)
-    for m in MODALITIES:
-        for scope, values in metrics["unique_pairs"][m]["negative_scopes"].items():
-            original = baseline["unique_pairs"][m]["negative_scopes"][scope]["FAR_h"]
-            if values["FAR_h"] is not None and values["FAR_h"] > original + args.max_far_h_increase + 1e-12:
-                reasons.append(f"{m}.{scope}.FAR_h increased by more than {args.max_far_h_increase}")
-    return not reasons, reasons
-
-
 def better(candidate, best, args):
     for key in ("mean_unique_bch_exact_recovery_fraction", "mean_unique_within_radius_fraction"):
         if abs(candidate[key] - best[key]) > 1e-12:
@@ -229,7 +122,7 @@ def train_trial(model, arm, seed, data, users, cache, rows, plan, baseline, args
     progress = common.Progress(f"{arm}/{model.config.mode} seed={seed}", args.epochs, future, args.log_interval)
     for epoch in range(1, args.epochs + 1):
         model.train()
-        batches, padding = previous.make_schedule(data, users, args, seed, epoch, "threshold", schedules)
+        batches, padding = train_ops.make_schedule(data, users, args, seed, epoch, "threshold", schedules)
         steps = len(batches) + evaluation_steps(rows, args.batch_size, args.bch_batch_size)
         sums, count = defaultdict(float), 0
         for step, (batch, _) in enumerate(batches, 1):
@@ -343,15 +236,9 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
     try:
         common.write_json(args.output_dir / "status.json", {"state": "running", "synthetic_test_only": synthetic})
         if not synthetic:
-            for name in previous.MANIFESTS:
+            for name in protocol.MANIFESTS:
                 shutil.copy2(args.source_run / name, args.output_dir / name)
-        paths = [Path(__file__), Path(base.__file__), Path(previous.__file__), Path(common.__file__),
-                 Path(contrastive.__file__), Path(base.architectures.__file__), ROOT / "Thresholding_Model_512.py",
-                 ROOT / "thresholding/variability_model.py", ROOT / "Thresholding Model.py",
-                 ROOT / "scripts/train_reliability_distance.py", ROOT / "scripts/train_thresholding_ablation.py",
-                 ROOT / "scripts/bch_evaluator.py", ROOT / "scripts/fusion_bch_bridge.cpp",
-                 ROOT / "BCH/BCH.cpp", ROOT / "BCH/BCH.hpp"]
-        code_hashes = {str(path): common.sha256(path) for path in paths}
+        code_hashes = provenance.code_hashes(__file__)
         common.write_json(args.output_dir / "config.json", {
             **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, "descriptions": DESCRIPTIONS,
             "started_at_utc": datetime.now(timezone.utc).isoformat(), "python": platform.python_version(), "torch": str(torch.__version__),
@@ -365,8 +252,8 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
         log.message("ETA는 남은 최대 epoch 기준 추정이며 조기 종료·마지막 시험 평가에 따라 달라집니다.")
         bch = BCHEvaluator(args.output_dir / "bch_evaluator", args.bch_t)
         cache = {m: torch.tensor(values, device=args.device) for m, values in data.arrays.items()}
-        plans = {s: contrastive.evaluation_plan(pairs[s], users, "cpu") for s in ("validation", "test")}
-        zero = base.make_model(args, "zero", args.seeds[0])
+        plans = {s: metric_ops.evaluation_plan(pairs[s], users, "cpu") for s in ("validation", "test")}
+        zero = train_ops.make_coordinate_model(args, "zero", args.seeds[0])
         baseline_progress = common.Progress("tau=0 검증", 1, 0, args.log_interval)
         steps = evaluation_steps(pairs["validation"], args.batch_size, args.bch_batch_size)
         baseline, _, _, _ = evaluate(zero, cache, pairs["validation"], users, plans["validation"], args, bch,
@@ -380,7 +267,7 @@ def run(args, data, users, pairs, source, source_hashes, *, synthetic=False):
             current = args.output_dir / f"{mode}_{arm}_seed{seed}"
             current.mkdir()
             common.write_json(current / "status.json", {"state": "training"})
-            model = base.make_model(args, mode, seed)
+            model = train_ops.make_coordinate_model(args, mode, seed)
             digest, key = state_digest(model), f"{mode}:seed{seed}"
             if key in initial_hashes and initial_hashes[key] != digest:
                 raise RuntimeError("A/B/C initial states differ")
@@ -463,7 +350,7 @@ def parse_args(argv=None):
             "max_genuine_increase_bits": .5, "max_genuine_p95_increase_bits": 5., "max_row_outside_increase": .01,
             "max_constant_increase": .02, "max_coordinate_balance_increase": .005, "max_far_h_increase": 0.}.items():
         p.add_argument("--" + name.replace("_", "-"), type=float, default=value)
-    for name, value in asdict(contrastive.LossSettings()).items():
+    for name, value in asdict(loss_ops.LossSettings()).items():
         p.add_argument("--" + name.replace("_", "-"), type=type(value), default=value)
     p.add_argument("--check-only", action="store_true")
     args = p.parse_args(argv)
@@ -484,7 +371,7 @@ def parse_args(argv=None):
     if args.max_far_h_increase > 1:
         p.error("max-far-h-increase must be <= 1")
     try:
-        contrastive.loss_settings(args)
+        loss_ops.loss_settings(args)
     except ValueError as error:
         p.error(str(error))
     args.source_run = args.source_run.expanduser().resolve()
@@ -508,7 +395,7 @@ def main(argv=None):
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     print("기존 임베딩·사람 단위 분할·등록/질의 쌍을 확인합니다.", flush=True)
-    data, users, pairs, source, hashes = previous.prepare_source(args)
+    data, users, pairs, source, hashes = provenance.prepare_source(args)
     if args.output_dir.is_relative_to(data.directory.resolve()):
         raise ValueError("Output cannot be inside the input embeddings")
     if args.check_only:

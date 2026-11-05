@@ -1,7 +1,7 @@
 # 512차원 Thresholding 모델 실험
 
 모델: `../Thresholding_Model_512.py`의 `ThresholdingModel512`.
-실행: `train_thresholding_512.py`. 기존 scalar 모델과 이전 결과는 수정하지 않는다.
+실행: `scripts/s05_threshold512/train.py`. 기존 scalar 모델과 이전 결과는 수정하지 않는다.
 
 ## 구조
 
@@ -44,7 +44,7 @@ dynamic: tau(x) = 0.01 * tanh(theta) + 0.01 * tanh(g(x))
 
 ```bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh -u \
-  /home/uxm2/hsh/2026_2/multimodal_biometric/scripts/train_thresholding_512.py \
+  -m scripts.s05_threshold512.train \
   --device cuda --modes zero fixed dynamic --seeds 17 29 43 \
   --threshold-epochs 100 --reliability-epochs 60 --patience 15 --batch-size 64
 ```
@@ -61,7 +61,7 @@ ETA는 현재 단계의 속도와 남은 최대 epoch에 따른 추정이며 조
 
 ```bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  /home/uxm2/hsh/2026_2/multimodal_biometric/scripts/train_thresholding_512.py \
+  -m scripts.s05_threshold512.train \
   --check-only --device cpu
 ```
 
@@ -146,5 +146,5 @@ model = ThresholdingModel512(Thresholding512Config(mode="dynamic"))
 
 ```bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  -m unittest scripts.tests.test_thresholding_512 -v
+  -m unittest scripts.tests.test_threshold512 -v
 ```

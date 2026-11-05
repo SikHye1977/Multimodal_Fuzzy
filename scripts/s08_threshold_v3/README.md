@@ -5,7 +5,7 @@
 사용자 ID, 등록/질의 쌍 전체, FE 보조정보, 암호 키는 추론 입력이 아니다.
 
 - 모델: 프로젝트 루트의 **Thresholding Model V3.py**
-- 실험: **scripts/train_thresholding_v3.py**
+- 실험: **scripts/s08_threshold_v3/train.py**
 
 ## 구조와 네 가지 비교
 
@@ -132,7 +132,7 @@ STE = hard.detach() + soft - soft.detach()
 
 ~~~bash
 cd /home/uxm2/hsh/2026_2/multimodal_biometric
-bash feature_extractors/run.sh scripts/train_thresholding_v3.py \
+bash feature_extractors/run.sh -m scripts.s08_threshold_v3.train \
   --device cuda --seeds 17 29 43 --epochs 100 --patience 20
 ~~~
 
@@ -140,21 +140,21 @@ bash feature_extractors/run.sh scripts/train_thresholding_v3.py \
 
 ~~~bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  scripts/train_thresholding_v3.py --check-only
+  -m scripts.s08_threshold_v3.train --check-only
 ~~~
 
 한 모드/한 seed만 실행:
 
 ~~~bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  scripts/train_thresholding_v3.py --device cuda --modes separate_512 --seeds 17
+  -m scripts.s08_threshold_v3.train --device cuda --modes separate_512 --seeds 17
 ~~~
 
 기존 독립 입력 512차원 모델을 같은 손실로 추가 비교하려면 모드를 명시한다(15회):
 
 ~~~bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  scripts/train_thresholding_v3.py --device cuda \
+  -m scripts.s08_threshold_v3.train --device cuda \
   --modes shared_scalar separate_scalar shared_512 separate_512 independent_512
 ~~~
 
@@ -218,8 +218,7 @@ fingerprint_bits = output["fingerprint_bits"]
 
 ~~~bash
 bash /home/uxm2/hsh/2026_2/multimodal_biometric/feature_extractors/run.sh \
-  -m unittest scripts.tests.test_thresholding_v3 -v
+  -m unittest scripts.tests.test_threshold_v3 -v
 ~~~
 
 테스트는 합성 데이터만 최적화하며 실제 생체 데이터를 학습하지 않는다.
-

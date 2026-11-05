@@ -11,8 +11,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from scripts import train_thresholding_c_fixed_dynamic as ex
-from scripts.tests.test_thresholding_reliability_abc import synthetic_data
+from scripts.s07_fixed_dynamic import train as ex
+from scripts.tests.helpers import synthetic_data
 
 
 class CFixedDynamicTests(unittest.TestCase):
@@ -33,9 +33,9 @@ class CFixedDynamicTests(unittest.TestCase):
     def test_initial_outputs_and_training_schedules_match(self):
         digests, schedules, batches = [], {}, []
         for mode in ex.MODES:
-            model = ex.base.make_model(self.args, mode, 17)
+            model = ex.train_ops.make_coordinate_model(self.args, mode, 17)
             digests.append(ex.initial_output_digest(model, self.cache, self.pairs["train"]))
-            rows, _ = ex.previous.make_schedule(self.data, self.users, self.args, 17, 1, "threshold", schedules)
+            rows, _ = ex.train_ops.make_schedule(self.data, self.users, self.args, 17, 1, "threshold", schedules)
             batches.append(rows)
         self.assertEqual(digests[0], digests[1])
         self.assertEqual(len(schedules), 1)
@@ -44,13 +44,13 @@ class CFixedDynamicTests(unittest.TestCase):
 
     def test_dynamic_uses_own_input_and_c_loss_updates_only_thresholds(self):
         for mode in ex.MODES:
-            model = ex.base.make_model(self.args, mode, 17).set_stage("threshold")
+            model = ex.train_ops.make_coordinate_model(self.args, mode, 17).set_stage("threshold")
             optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=.001)
             rows = self.pairs["train"]
             for _ in range(3):
                 optimizer.zero_grad(set_to_none=True)
-                e, q = ex.abc.quantize_pair(model, self.cache, rows)
-                loss = ex.abc.threshold_loss(model, e, q, rows, self.users, self.args, "C")["total"]
+                e, q = ex.train_ops.quantize_pair(model, self.cache, rows)
+                loss = ex.loss_ops.bch_threshold_loss(model, e, q, rows, self.users, self.args, "C")["total"]
                 loss.backward()
                 self.assertTrue(all(p.grad is None for p in model.reliability.parameters()))
                 for m in ex.MODALITIES:
@@ -81,9 +81,9 @@ class CFixedDynamicTests(unittest.TestCase):
         # Repeat a successful pair; its contribution must not be counted twice.
         rows = np.concatenate((rows, rows[:1]))
         e, q = ({k: torch.cat((v, v[:1])) for k, v in out.items()} for out in (e, q))
-        plan = ex.abc.contrastive.evaluation_plan(rows, self.users, "cpu")
-        model = ex.base.make_model(self.args, "fixed", 17)
-        with patch.object(ex.previous, "collect", return_value=(e, q)):
+        plan = ex.metric_ops.evaluation_plan(rows, self.users, "cpu")
+        model = ex.train_ops.make_coordinate_model(self.args, "fixed", 17)
+        with patch.object(ex.train_ops, "collect", return_value=(e, q)):
             result, _, _ = ex.evaluate(model, self.cache, rows, self.users, plan, self.args)
         for m in ex.MODALITIES:
             metric = result["unique_pairs"][m]
@@ -108,7 +108,7 @@ class CFixedDynamicTests(unittest.TestCase):
                 ex.parse_args(values)
 
     def test_synthetic_pipeline_exports_paired_comparison_without_bch(self):
-        with patch.object(ex.abc, "BCHEvaluator", side_effect=AssertionError("No decoder is required")), redirect_stdout(io.StringIO()):
+        with patch.object(ex, "BCHEvaluator", side_effect=AssertionError("No decoder is required")), redirect_stdout(io.StringIO()):
             report = ex.run(self.args, self.data, self.users, self.pairs, {"temperature": .02, "seed": 17}, {}, synthetic=True)
         self.assertEqual(len(report["trials"]), 2)
         self.assertEqual(len(report["paired_deltas"]), 4)
@@ -120,7 +120,7 @@ class CFixedDynamicTests(unittest.TestCase):
         self.assertFalse((self.args.output_dir/"bch_evaluator").exists())
         for trial in report["trials"]:
             folder = Path(trial["checkpoint"]).parent
-            model, meta = ex.abc.ThresholdingModel512.load_checkpoint(trial["checkpoint"])
+            model, meta = ex.ThresholdingModel512.load_checkpoint(trial["checkpoint"])
             self.assertEqual(meta["selection_metric"], ex.PRIMARY)
             self.assertFalse(bool(model.reliability_fitted))
             self.assertEqual(trial["threshold"]["epochs_run"], 2)
