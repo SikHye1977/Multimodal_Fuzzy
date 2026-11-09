@@ -109,3 +109,16 @@
 **/.venv/
 **/venv/
 **/__pycache__/
+
+# C1 standalone experiment publication files.
+!/scripts/s16_quantile_thresholding/README.md
+!/scripts/s16_quantile_thresholding/__init__.py
+!/scripts/s16_quantile_thresholding/attacks.py
+!/scripts/s16_quantile_thresholding/c1.py
+!/scripts/s16_quantile_thresholding/diagnostics.py
+!/scripts/s16_quantile_thresholding/evaluation.py
+!/scripts/s16_quantile_thresholding/model.py
+!/scripts/s16_quantile_thresholding/protocol.py
+!/scripts/s16_quantile_thresholding/reporting.py
+!/scripts/s16_quantile_thresholding/sketch.py
+!/scripts/s16_quantile_thresholding/test_c1.py

@@ -75,6 +75,17 @@ scripts/s08_threshold_v3/train.py
 scripts/s09_multisample/README.md
 scripts/s09_multisample/__init__.py
 scripts/s09_multisample/train.py
+scripts/s16_quantile_thresholding/README.md
+scripts/s16_quantile_thresholding/__init__.py
+scripts/s16_quantile_thresholding/attacks.py
+scripts/s16_quantile_thresholding/c1.py
+scripts/s16_quantile_thresholding/diagnostics.py
+scripts/s16_quantile_thresholding/evaluation.py
+scripts/s16_quantile_thresholding/model.py
+scripts/s16_quantile_thresholding/protocol.py
+scripts/s16_quantile_thresholding/reporting.py
+scripts/s16_quantile_thresholding/sketch.py
+scripts/s16_quantile_thresholding/test_c1.py
 scripts/tests/__init__.py
 scripts/tests/helpers.py
 scripts/tests/test_bch_loss_abc.py

@@ -112,3 +112,19 @@ BCH 코드 자체의 테스트는 `make -C BCH test`로 실행할 수 있습니�
 `test_bch_loss_abc`에는 다섯 스크립트가 Fusion 모듈을 가져오지 않는지 확인하는 검사와
 0~32비트 오류의 실제 복구 검사가 포함됩니다. 정정 범위 이내 비율, 실제 BCH 비트 복원율,
 암호 키 복원율은 서로 다른 지표입니다. 이 저장소는 전체 FE의 키 생성·복구 보안을 검증하지 않습니다.
+
+## C1: 4비트 분위수 보조정보 실험
+
+등록 5장·질의 1장, 고정 등록 512비트와 BCH t=32를 유지하는 C1을 추가했습니다.
+실행 방법과 보안 평가 범위는 [C1 설명서](scripts/s16_quantile_thresholding/README.md)에 있습니다.
+
+```bash
+python -m scripts.s16_quantile_thresholding.c1 --check-only --device cpu
+python -m scripts.s16_quantile_thresholding.c1 --device cuda
+python -m unittest scripts.s16_quantile_thresholding.test_c1 -v
+```
+
+C1 실행기는 V5/V6 및 다른 후속 실험 패키지에 의존하지 않습니다.
+기존 수식과 평가를 분리한 코드이며 C1, tau=0, 누출 양성 대조군만 실행합니다.
+데이터·임베딩·가중치·실험 결과는 포함하지 않습니다. 코드/보조정보를 공개한 상태의
+공격 진단을 제공하지만 전체 시스템의 zero leakage나 특정 보안 강도를 보장하지 않습니다.
