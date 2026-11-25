@@ -9,6 +9,7 @@ BCH/tests/test_bch.cpp
 PUBLICATION_FILES.txt
 README.md
 Thresholding Model V3.py
+Thresholding Model V5.py
 Thresholding Model.py
 Thresholding_Model_512.py
 Thresholding_Model_Set.py
@@ -75,6 +76,15 @@ scripts/s08_threshold_v3/train.py
 scripts/s09_multisample/README.md
 scripts/s09_multisample/__init__.py
 scripts/s09_multisample/train.py
+scripts/s11_threshold_v5/__init__.py
+scripts/s11_threshold_v5/evaluation.py
+scripts/s11_threshold_v5/losses.py
+scripts/s11_threshold_v5/model.py
+scripts/s11_threshold_v5/protocol.py
+scripts/s11_threshold_v5/train.py
+scripts/s12_v5_capacity/__init__.py
+scripts/s12_v5_capacity/diagnostics.py
+scripts/s12_v5_capacity/train.py
 scripts/s16_quantile_thresholding/README.md
 scripts/s16_quantile_thresholding/__init__.py
 scripts/s16_quantile_thresholding/attacks.py
@@ -86,6 +96,14 @@ scripts/s16_quantile_thresholding/protocol.py
 scripts/s16_quantile_thresholding/reporting.py
 scripts/s16_quantile_thresholding/sketch.py
 scripts/s16_quantile_thresholding/test_c1.py
+scripts/s19_neural_threshold/README.md
+scripts/s19_neural_threshold/__init__.py
+scripts/s19_neural_threshold/learning.py
+scripts/s19_neural_threshold/losses.py
+scripts/s19_neural_threshold/model.py
+scripts/s19_neural_threshold/reporting.py
+scripts/s19_neural_threshold/test_experiment.py
+scripts/s19_neural_threshold/train.py
 scripts/tests/__init__.py
 scripts/tests/helpers.py
 scripts/tests/test_bch_loss_abc.py

@@ -128,3 +128,23 @@ C1 실행기는 V5/V6 및 다른 후속 실험 패키지에 의존하지 않습�
 기존 수식과 평가를 분리한 코드이며 C1, tau=0, 누출 양성 대조군만 실행합니다.
 데이터·임베딩·가중치·실험 결과는 포함하지 않습니다. 코드/보조정보를 공개한 상태의
 공격 진단을 제공하지만 전체 시스템의 zero leakage나 특정 보안 강도를 보장하지 않습니다.
+
+## S19-D: 등록 집합 인코더와 복구 경계 손실
+
+[S19 설명서](scripts/s19_neural_threshold/README.md)에 등록 5장 기반 512차원 τ,
+10 epoch warm-up과 복구 경계·성공 유지 손실, 공개 τ 공격 및 BCH 평가를 정리했습니다.
+`--arms D`는 D만 실행합니다. 원실험의 A/B/C/D 공통 구현은 호환성을 위해 유지합니다.
+S11의 모델·학습 도구와 S12의 진단·출력 경로 도구를 필수 의존 파일로 포함하며,
+이미 공개된 S16 공격 평가 코드를 재사용합니다. Fusion은 필요하지 않습니다.
+
+```bash
+bash feature_extractors/run.sh -m scripts.s19_neural_threshold.train --arms D --check-only --device cpu
+bash feature_extractors/run.sh -u -m scripts.s19_neural_threshold.train --arms D --device cuda --seeds 17 29 43
+bash feature_extractors/run.sh -m unittest scripts.s19_neural_threshold.test_experiment -v
+```
+
+새 환경에서는 위 데이터 준비 절차를 완료하고 `--source-run`과 `--embedding-dir`을
+지정합니다. 데이터·가중치·체크포인트·결과는 포함하지 않습니다.
+기존 D/last(epoch 100)는 공개 τ 공격에서 얼굴·지문 BCH 등록 비트 복원이 모두 100%였으므로,
+높은 정상 복구율이 공개정보 보호까지 만족한 결과는 아닙니다. 보안 제약으로 선택한
+best는 세 seed 모두 epoch 0이었으며, 코드에서도 best/last를 별도로 평가합니다.
